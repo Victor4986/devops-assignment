@@ -56,24 +56,31 @@ jobs:
           username: ${{ github.actor }}           # Người trigger workflow
           password: ${{ secrets.GITHUB_TOKEN }}   # Token tự động, có quyền packages:write
 
-      # ─── Bước 8: Build & push image (cả 2 kiến trúc + SBOM + provenance) ───
+      # ─── Bước 8: Lowercase repo name (Docker refs bắt buộc lowercase) ───
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # ─── Bước 9: Build & push image (cả 2 kiến trúc + SBOM + provenance) ───
+      # LƯU Ý: trong block "|", ký tự "#" KHÔNG phải comment — sẽ bị nuốt vào tag.
+      # Muốn giải thích thì viết comment ở NGOÀI block, không viết cùng dòng với tag.
       - name: Build & push
-        id: push                                  # ID để step sau tham chiếu output
+        id: push
         uses: docker/build-push-action@v6
         with:
-          context: ./app                          # Build context = thư mục app/ (nơi có Dockerfile)
-          push: true                              # Push lên registry sau khi build xong
-          platforms: linux/amd64,linux/arm64      # Build đồng thời 2 kiến trúc (fix vấn đề M1)
-          tags: |                                 # Nhiều tag cùng point tới 1 image
-            ghcr.io/${{ github.repository }}:${{ github.sha }}   # Tag theo SHA commit — immutable, dễ trace
-            ghcr.io/${{ github.repository }}:latest              # Tag "latest" — dev tiện, prod tránh
-          sbom: true                              # Sinh SBOM (Software Bill of Materials) attach vào image
-          provenance: mode=max                    # SLSA provenance chi tiết nhất (build inputs, env, deps)
+          context: ./app
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ steps.img.outputs.name }}:latest
+          sbom: true
+          provenance: mode=max
 
-      # ─── Bước 9: Sign & upload attestation lên GHCR bằng Sigstore keyless ───
+      # ─── Bước 10: Sign & upload attestation lên GHCR bằng Sigstore keyless ───
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ghcr.io/${{ github.repository }}    # Image tên gì
-          subject-digest: ${{ steps.push.outputs.digest }}  # Digest sha256 lấy từ step "push" ở trên
-          push-to-registry: true                            # Đẩy attestation kèm image (ORAS format)
+          subject-name: ${{ steps.img.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
