@@ -1,0 +1,79 @@
+# Tên workflow — hiện ở tab Actions của repo
+name: CI
+
+# Trigger — khi nào workflow chạy
+on:
+  push:
+    branches: [main]      # Chạy khi có commit push lên nhánh main
+  pull_request:            # Chạy khi mở/update PR (test trước khi merge)
+  workflow_dispatch:       # Cho phép chạy tay từ UI Actions (nút "Run workflow")
+
+# Quyền của GITHUB_TOKEN mà workflow được cấp — nguyên tắc least privilege
+permissions:
+  contents: read           # Đọc code repo (checkout)
+  packages: write          # Push image lên ghcr.io (packages = ghcr)
+  id-token: write          # Sinh OIDC token — cần cho Sigstore keyless signing
+  attestations: write      # Ghi attestation lên GitHub (build provenance)
+
+# Định nghĩa các job — mỗi job là 1 VM riêng
+jobs:
+  test-and-push:           # Tên job (tuỳ ý) — hiện trên UI
+    runs-on: ubuntu-latest # Runner GitHub-hosted, Ubuntu mới nhất (x86_64/amd64)
+    steps:                 # Chuỗi bước — chạy tuần tự trên cùng 1 VM
+      # ─── Bước 1: Lấy code về runner ───
+      - uses: actions/checkout@v4    # Action clone repo vào $GITHUB_WORKSPACE
+
+      # ─── Bước 2: Cài Node 20 + cache npm để lần sau nhanh hơn ───
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'                        # Cài Node.js 20
+          cache: 'npm'                              # Bật cache thư mục ~/.npm
+          cache-dependency-path: app/package-lock.json  # Cache key dựa vào hash file này
+
+      # ─── Bước 3: Cài dependencies (dùng ci không phải install → deterministic) ───
+      - name: Install deps
+        working-directory: app       # Chuyển cwd sang thư mục app/ trước khi chạy
+        run: npm ci                  # ci = install từ lock file, fail nếu lock lệch package.json
+
+      # ─── Bước 4: Chạy test — nếu fail toàn bộ workflow dừng ───
+      - name: Run tests
+        working-directory: app
+        run: npm test                # Gọi script "test" trong package.json
+
+      # ─── Bước 5: QEMU — cho phép emulate CPU khác kiến trúc (build ARM trên AMD) ───
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3   # Đăng ký binfmt_misc handler cho ARM
+
+      # ─── Bước 6: Buildx — Docker builder tiên tiến (cần cho multi-arch, BuildKit) ───
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3  # Tạo builder mới, dùng driver docker-container
+
+      # ─── Bước 7: Login vào GitHub Container Registry (ghcr.io) ───
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io                       # Registry đích
+          username: ${{ github.actor }}           # Người trigger workflow
+          password: ${{ secrets.GITHUB_TOKEN }}   # Token tự động, có quyền packages:write
+
+      # ─── Bước 8: Build & push image (cả 2 kiến trúc + SBOM + provenance) ───
+      - name: Build & push
+        id: push                                  # ID để step sau tham chiếu output
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app                          # Build context = thư mục app/ (nơi có Dockerfile)
+          push: true                              # Push lên registry sau khi build xong
+          platforms: linux/amd64,linux/arm64      # Build đồng thời 2 kiến trúc (fix vấn đề M1)
+          tags: |                                 # Nhiều tag cùng point tới 1 image
+            ghcr.io/${{ github.repository }}:${{ github.sha }}   # Tag theo SHA commit — immutable, dễ trace
+            ghcr.io/${{ github.repository }}:latest              # Tag "latest" — dev tiện, prod tránh
+          sbom: true                              # Sinh SBOM (Software Bill of Materials) attach vào image
+          provenance: mode=max                    # SLSA provenance chi tiết nhất (build inputs, env, deps)
+
+      # ─── Bước 9: Sign & upload attestation lên GHCR bằng Sigstore keyless ───
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}    # Image tên gì
+          subject-digest: ${{ steps.push.outputs.digest }}  # Digest sha256 lấy từ step "push" ở trên
+          push-to-registry: true                            # Đẩy attestation kèm image (ORAS format)
